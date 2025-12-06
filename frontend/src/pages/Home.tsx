@@ -6,6 +6,17 @@ import Icon from '../components/Icon';
 
 const sanitizeCode = (code: string) => code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
+const computeApiBase = () => {
+  const envUrl = import.meta.env.VITE_SIGNALING_URL;
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+  const pagesFallback = hostname.includes('pages.dev')
+    ? 'https://vibeme-call.onrender.com'
+    : undefined;
+  return (envUrl || pagesFallback || window.location.origin).replace(/\/$/, '');
+};
+
+const API_BASE = computeApiBase();
+
 export default function Home() {
   const navigate = useNavigate();
   const [isJoinOpen, setJoinOpen] = useState(false);
@@ -24,7 +35,7 @@ export default function Home() {
   const handleCreate = async () => {
     setCreating(true);
     try {
-      const res = await fetch('/api/room', { method: 'POST' });
+      const res = await fetch(`${API_BASE}/api/room`, { method: 'POST' });
       if (!res.ok) throw new Error('Unable to create room');
       const data = (await res.json()) as { code: string };
       const code = sanitizeCode(data.code);
@@ -47,7 +58,7 @@ export default function Home() {
     }
     setChecking(true);
     try {
-      const res = await fetch(`/api/room/${code}/exists`);
+      const res = await fetch(`${API_BASE}/api/room/${code}/exists`);
       if (!res.ok) throw new Error('Room check failed');
       const data = (await res.json()) as { exists: boolean; full?: boolean };
       if (!data.exists) {

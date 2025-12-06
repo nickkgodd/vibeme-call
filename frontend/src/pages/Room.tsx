@@ -27,9 +27,19 @@ const isLocalHostLike = (hostname: string) => {
   return false;
 };
 
-const SIGNALING_URL =
-  import.meta.env.VITE_SIGNALING_URL ||
-  (typeof window !== 'undefined' ? `${window.location.origin.replace(/\/$/, '')}` : '');
+const computeSignalingUrl = () => {
+  const envUrl = import.meta.env.VITE_SIGNALING_URL;
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+  const pagesFallback = hostname.includes('pages.dev')
+    ? 'https://vibeme-call.onrender.com'
+    : undefined;
+  return (envUrl || pagesFallback || (typeof window !== 'undefined'
+    ? `${window.location.origin.replace(/\/$/, '')}`
+    : '')
+  ).replace(/\/$/, '');
+};
+
+const SIGNALING_URL = computeSignalingUrl();
 
 const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 const ROOM_LIMIT = 4;
