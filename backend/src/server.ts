@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -29,7 +29,7 @@ app.use(
 );
 
 if (process.env.ENFORCE_HTTPS === 'true') {
-  app.use((req, res, next) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.secure) return next();
     return res.redirect(`https://${req.headers.host}${req.originalUrl}`);
   });
@@ -80,11 +80,11 @@ const cleanupRooms = () => {
 
 setInterval(cleanupRooms, 60_000);
 
-app.get('/health', (_req, res) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
-app.post('/api/room', (_req, res) => {
+app.post('/api/room', (_req: Request, res: Response) => {
   let code = generateRoomCode();
   while (rooms.has(code)) {
     code = generateRoomCode();
@@ -93,7 +93,7 @@ app.post('/api/room', (_req, res) => {
   res.json({ code });
 });
 
-app.get('/api/room/:code/exists', (req, res) => {
+app.get('/api/room/:code/exists', (req: Request, res: Response) => {
   const code = sanitizeCode(req.params.code || '');
   const exists = rooms.has(code);
   const full = exists ? (rooms.get(code)?.size || 0) >= ROOM_LIMIT : false;
