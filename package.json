@@ -1,0 +1,10 @@
+{
+  "name": "vibeme-call-root",
+  "private": true,
+  "scripts": {
+    "build": "cd frontend && npm install && npm run build",
+    "dev": "cd frontend && npm run dev",
+    "install": "cd frontend && npm install"
+  }
+}
+
