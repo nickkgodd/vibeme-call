@@ -44,3 +44,4 @@ export default function Icon({ name, className, size = 22 }: IconProps) {
   );
 }
 
+

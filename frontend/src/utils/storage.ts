@@ -18,3 +18,4 @@ const setBooleanPref = (key: string, value: boolean) => {
 
 export { booleanPref as getBooleanPref, setBooleanPref };
 
+

@@ -1,12 +1,15 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
+import { createServer as createHttpsServer } from 'https';
 import { Server } from 'socket.io';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
+import selfsigned from 'selfsigned';
 
 type ParticipantInfo = { socketId: string; name: string; lastSeen: number };
 
 const PORT = Number(process.env.PORT || 3001);
+const DEV_SSL = process.env.DEV_SSL === 'true';
 const ROOM_LIMIT = 4;
 const ROOM_TTL_MS = 5 * 60 * 1000;
 const ROOM_CODE_LENGTH = 8;
@@ -14,28 +17,68 @@ const ROOM_CODE_LENGTH = 8;
 const allowedOrigins =
   process.env.ALLOWED_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean) || [
     'http://localhost:5173',
-    'http://127.0.0.1:5173'
+    'http://127.0.0.1:5173',
+    'http://192.168.0.6:5173',
+    'http://192.168.56.1:5173',
+    'http://198.18.0.1:5173',
+    'https://localhost:5173',
+    'https://127.0.0.1:5173',
+    'https://192.168.0.6:5173',
+    'https://192.168.56.1:5173',
+    'https://198.18.0.1:5173'
   ];
 
 const app = express();
 app.disable('x-powered-by');
 app.enable('trust proxy');
-app.use(express.json());
+app.use(express.json({ limit: '128kb' }));
 app.use(
   cors({
     origin: allowedOrigins,
-    credentials: true
+    credentials: false
   })
 );
 
-if (process.env.ENFORCE_HTTPS === 'true') {
+const enforceHttps = process.env.ENFORCE_HTTPS === 'true';
+if (enforceHttps) {
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.secure) return next();
     return res.redirect(`https://${req.headers.host}${req.originalUrl}`);
   });
 }
 
-const httpServer = createServer(app);
+let httpServer: ReturnType<typeof createServer> | ReturnType<typeof createHttpsServer>;
+if (DEV_SSL) {
+  try {
+    // Prefer mkcert certs if available
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('path');
+    const rootCertDir = fs.existsSync(path.join(process.cwd(), '.certs'))
+      ? path.join(process.cwd(), '.certs')
+      : path.join(process.cwd(), '..', '.certs');
+    const keyPath = path.join(rootCertDir, 'dev-key.pem');
+    const certPath = path.join(rootCertDir, 'dev-cert.pem');
+    const key = fs.readFileSync(keyPath);
+    const cert = fs.readFileSync(certPath);
+    httpServer = createHttpsServer({ key, cert }, app);
+    console.log('DEV_SSL enabled: running HTTPS locally with mkcert certs');
+  } catch (err) {
+    console.warn('DEV_SSL enabled but certs not found, falling back to selfsigned');
+    const attrs = [{ name: 'commonName', value: 'localhost' }];
+    const pems = selfsigned.generate(attrs, { days: 1, keySize: 2048 });
+    httpServer = createHttpsServer(
+      {
+        key: pems.private,
+        cert: pems.cert
+      },
+      app
+    );
+  }
+} else {
+  httpServer = createServer(app);
+}
 const io = new Server(httpServer, {
   cors: { origin: allowedOrigins }
 });
@@ -44,13 +87,11 @@ const rooms: Map<string, Set<string>> = new Map();
 const participants: Map<string, Map<string, ParticipantInfo>> = new Map();
 const roomActivity: Map<string, number> = new Map();
 
-const base62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const generateRoomCode = () => {
-  let code = '';
-  for (let i = 0; i < ROOM_CODE_LENGTH; i += 1) {
-    code += base62.charAt(Math.floor(Math.random() * base62.length));
-  }
-  return code.toUpperCase();
+  return randomBytes(ROOM_CODE_LENGTH)
+    .toString('base64url')
+    .slice(0, ROOM_CODE_LENGTH)
+    .toUpperCase();
 };
 
 const sanitizeCode = (code: string) => code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -64,6 +105,31 @@ const ensureRoom = (code: string) => {
 };
 
 const touchRoom = (code: string) => roomActivity.set(code, Date.now());
+
+// Simple in-memory rate limiter for REST (per IP)
+const rateLimitStore = new Map<
+  string,
+  {
+    count: number;
+    resetAt: number;
+  }
+>();
+const RATE_LIMIT = 60; // requests
+const RATE_WINDOW_MS = 60_000; // per minute
+const rateLimitMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const entry = rateLimitStore.get(ip);
+  if (!entry || entry.resetAt < now) {
+    rateLimitStore.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    return next();
+  }
+  if (entry.count >= RATE_LIMIT) {
+    return res.status(429).json({ ok: false, reason: 'Too many requests' });
+  }
+  entry.count += 1;
+  return next();
+};
 
 const cleanupRooms = () => {
   const now = Date.now();
@@ -84,7 +150,7 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
-app.post('/api/room', (_req: Request, res: Response) => {
+app.post('/api/room', rateLimitMiddleware, (_req: Request, res: Response) => {
   let code = generateRoomCode();
   while (rooms.has(code)) {
     code = generateRoomCode();
@@ -93,7 +159,7 @@ app.post('/api/room', (_req: Request, res: Response) => {
   res.json({ code });
 });
 
-app.get('/api/room/:code/exists', (req: Request, res: Response) => {
+app.get('/api/room/:code/exists', rateLimitMiddleware, (req: Request, res: Response) => {
   const code = sanitizeCode(req.params.code || '');
   const exists = rooms.has(code);
   const full = exists ? (rooms.get(code)?.size || 0) >= ROOM_LIMIT : false;
@@ -163,6 +229,8 @@ io.on('connection', (socket) => {
       if (!meta || !from || !to) return;
       const target = meta.get(to);
       if (target) {
+        if (!description || typeof description.type !== 'string') return;
+        if (JSON.stringify(description).length > 120_000) return;
         io.to(target.socketId).emit('offer', { from, description });
       }
     }
@@ -177,6 +245,8 @@ io.on('connection', (socket) => {
       if (!meta || !from || !to) return;
       const target = meta.get(to);
       if (target) {
+        if (!description || typeof description.type !== 'string') return;
+        if (JSON.stringify(description).length > 120_000) return;
         io.to(target.socketId).emit('answer', { from, description });
       }
     }
@@ -191,6 +261,7 @@ io.on('connection', (socket) => {
       if (!meta || !from || !to || !candidate) return;
       const target = meta.get(to);
       if (target) {
+        if (JSON.stringify(candidate).length > 5_000) return;
         io.to(target.socketId).emit('ice-candidate', { from, candidate });
       }
     }

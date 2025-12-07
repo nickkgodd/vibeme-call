@@ -1,0 +1,39 @@
+Code Audit – Weaknesses / Аудит слабых мест
+
+High-Level Overview / Краткий обзор
+- EN: Lean P2P audio flow, small React/Express footprint, no DB/logging, and client-side HTTPS redirect on the SPA keep the surface minimal.
+- RU: Минималистичный P2P-аудио стек, мало зависимостей, БД/логов нет, SPA уводит на HTTPS на клиенте — атач-поверхность компактна.
+- Risks below are ordered Critical→Low / Риски ниже отсортированы от критичных к низким.
+
+Critical / Критические
+- Connection/Privacy — Сигнальный/API сервер по умолчанию HTTP (ENFORCE_HTTPS=false), HSTS нет, CORS разрешает http origins; EN: Signaling/API default to HTTP with permissive CORS, HTTPS is optional only. Root cause: insecure defaults in `backend/src/server.ts` (L9-L36). Impact: MITM can read/alter SDP/ICE offers and inject peers, breaking confidentiality.
+- Availability/Scale — Все комнаты/участники в памяти одного инстанса; EN: Room state is in-process Maps only (`backend/src/server.ts` L43-L81) with no shared adapter. Root cause: non-stateless design. Impact: Render horizontal scale or restart drops rooms and splits peers across nodes (ghost rooms, failed joins), violating reliability target.
+- Abuse/DoS — Нет rate limiting/size caps на `/api/room`, `/api/room/:code/exists`, или socket events (`backend/src/server.ts` L24-L205); EN: no throttling on REST or signaling frames. Root cause: missing middleware/backpressure. Impact: attacker can brute-force codes, flood offers/ICE blobs, exhaust CPU/memory, denying calls.
+- Metadata leak — `/api/room/:code/exists` без авторизации раскрывает existence/full (`backend/src/server.ts` L96-L101); EN: unauthenticated probe leaks which rooms are live. Root cause: public endpoint with no CAPTCHA/rate limit. Impact: passive scanner can monitor active rooms (presence leak) and target joins.
+
+High / Высокие
+- NAT Traversal/Privacy — Только один STUN Google по умолчанию, TURN опционален и одиночный (`frontend/src/pages/Room.tsx` L44-L69); EN: STUN-only default with single optional TURN. Root cause: minimal ICE server list. Impact: symmetric NAT/captive Wi‑Fi fails to connect; also funnels metadata to Google STUN, hurting privacy.
+- Reconnect/ICE recovery — Socket.io ограничен 3 попытками (`frontend/src/pages/Room.tsx` L95-L99); при `connectionState` failed peer просто закрывается (`Room.tsx` L275-L279) без ICE restart/renegotiation. EN: short Wi‑Fi drop kills the call permanently. Root cause: no reconnection loop/ICE restart.
+- Build exposure — Vite собирает sourcemaps для продакшена (`frontend/vite.config.ts` L33-L35). EN: ships full source maps. Root cause: build.sourcemap=true. Impact: larger bundles on Pages and easy reverse-engineering of signaling/front logic (privacy risk).
+- Hardcoded fallback host — computeApiBase/computeSignalingUrl шьёт `https://vibeme-call.onrender.com` при pages.dev (`frontend/src/pages/Home.tsx` L9-L16, `Room.tsx` L30-L40). EN: hard-coded external backend. Root cause: baked fallback. Impact: metadata/traffic can silently route to someone else’s Render instance if env mis-set, breaking isolation.
+
+Medium / Средние
+- Room code entropy — Генератор кода использует Math.random, не криптостойкий (`backend/src/server.ts` L47-L54); EN: non-crypto RNG for room codes. Root cause: Math.random. Impact: lowers brute-force cost; combined with `/exists` + no rate limit increases discovery risk.
+- Persistent traces — Локальные настройки mute/speaker пишутся в localStorage (`frontend/src/utils/storage.ts` L1-L17; used in `Room.tsx` L74-L76, L322-L354). EN: persistent client traces conflict with “no traces” ethos. Root cause: durable storage for prefs. Impact: leaves local artifacts on shared devices.
+- Signaling payload validation — Нет проверки размера/схемы offer/answer/ICE (`backend/src/server.ts` L158-L197). EN: unbounded payloads. Root cause: direct emit relay without guards. Impact: oversized SDP/ICE can bloat memory or crash the process.
+- Mobile parity/resilience — UI remains audio-only grid with two columns (`frontend/src/pages/Room.tsx` L361-L479) and no low-bandwidth adaptations (DTX/bitrate caps). EN: on poor mobile links, lack of adaptive bitrate/Opus DTX can cause stalls and extra battery drain.
+- Edge caching/offline — Нет service worker или asset hinting; Pages relies on defaults (only `_redirects`). EN: no offline shell or preconnect. Root cause: missing SW/preload. Impact: slower cold starts and no resilience during brief outages.
+
+Low / Низкие
+- CORS credentials=true без куки/сессий (`backend/src/server.ts` L24-L29) — EN: unnecessary credentials flag; widens preflight surface though low risk.
+- UX copy — Ошибки микрофона разноязычные (RU toast + EN copy) (`Room.tsx` L114-L158); EN: mixed-language messaging may confuse users in incident flows.
+
+v2.0 Enhancements for Peak User Delight / Улучшения v2.0
+- Add multi-TURN/relay redundancy with health checks and `iceTransportPolicy` fallback to relay; prefer privacy-friendly TURN (no logs) and support Cloudflare Spectrum-style anycast.
+- Implement automatic ICE restart + re-offer loop on `connectionState` failed/disconnected, and extend socket reconnection with exponential backoff, so short Wi‑Fi/cellular flaps self-heal.
+- Ship client-side audio enhancements only: Opus DTX + built-in noise suppression/AGC toggles (no uplink of raw audio), lowering bandwidth and battery use on mobile.
+- Provide offline-ready shell: service worker caching for HTML/CSS/JS, preconnect to signaling URL, and graceful toast when offline; keep all analytics disabled.
+- Harden code secrecy: disable production sourcemaps, enable subresource integrity, add CSP default-src 'none' + connect-src only to configured signaling/TURN.
+- Privacy-first convenience: generate room links + QR codes locally (no server storage) and haptic feedback for mute/unmute on mobile; add single-tap “rejoin” when socket reconnects.
+- Add adaptive media policy: on poor RTT/packet loss, downgrade to opus low bitrate and prefer TURN relay automatically; expose a “Prefer relay” toggle for restrictive networks without storing it.
+

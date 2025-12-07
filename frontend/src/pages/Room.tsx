@@ -15,6 +15,7 @@ type JoinResponse =
 type SignalOffer = { from: string; description: RTCSessionDescriptionInit };
 type SignalAnswer = { from: string; description: RTCSessionDescriptionInit };
 type SignalCandidate = { from: string; candidate: RTCIceCandidateInit };
+type QualityLevel = 'good' | 'warn' | 'bad';
 
 const isLocalHostLike = (hostname: string) => {
   if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return true;
@@ -42,7 +43,30 @@ const computeSignalingUrl = () => {
 const SIGNALING_URL = computeSignalingUrl();
 
 const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: true },
+    autoGainControl: { ideal: true },
+    googEchoCancellation: true,
+    googAutoGainControl: true,
+    googNoiseSuppression: true,
+    googNoiseSuppression2: true,
+    sampleRate: 48000,
+    channelCount: 1
+  }
+};
 const ROOM_LIMIT = 4;
+const LAST_ROOM_KEY = 'vibeme-last-room';
+const REJOIN_WINDOW_MS = 10_000;
+const SPEAKING_THRESHOLD_DB = -40;
+const SPEAKING_DEBOUNCE_MS = 200;
+
+const buzz = (duration = 50) => {
+  if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    navigator.vibrate(duration);
+  }
+};
 
 export default function Room() {
   const params = useParams<{ code: string }>();
@@ -72,18 +96,33 @@ export default function Room() {
   const [self, setSelf] = useState<Participant | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [muted, setMuted] = useState(getBooleanPref('vibeme-mute', false));
-  const [speakerOn, setSpeakerOn] = useState(getBooleanPref('vibeme-speaker', false));
+  const [noiseCancelOn, setNoiseCancelOn] = useState(true);
   const [isLeaving, setIsLeaving] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [requestingMedia, setRequestingMedia] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'waiting' | 'in-call' | 'reconnecting'>('connecting');
+  const [showRejoin, setShowRejoin] = useState(false);
+  const [quality, setQuality] = useState<{ level: QualityLevel; jitter: number; loss: number }>({
+    level: 'good',
+    jitter: 0,
+    loss: 0
+  });
+  const [showQualityTip, setShowQualityTip] = useState(false);
+  const [speakingMap, setSpeakingMap] = useState<Record<string, boolean>>({});
 
   const socketRef = useRef<Socket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerConnections = useRef(new Map<string, RTCPeerConnection>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const userIdRef = useRef<string>('');
-  const sinkWarningShown = useRef(false);
   const joinedRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const vadNodesRef = useRef<Map<string, AnalyserNode>>(new Map());
+  const vadDataRef = useRef<Map<string, Float32Array>>(new Map());
+  const vadTimersRef = useRef<Map<string, number>>(new Map());
+  const vadActiveRef = useRef<Map<string, number>>(new Map());
+  const statsIntervalRef = useRef<number | null>(null);
+  const qualityTipTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!roomCode) {
@@ -94,17 +133,60 @@ export default function Room() {
     let cancelled = false;
     const socket = io(SIGNALING_URL, {
       transports: ['websocket'],
-      reconnectionAttempts: 3,
-      reconnectionDelay: 1000
+      reconnectionAttempts: 10,
+      reconnectionDelay: 800,
+      reconnectionDelayMax: 6000
     });
     socketRef.current = socket;
+    setConnectionStatus('connecting');
 
     const handleDisconnect = (reason: string) => {
       if (isLeaving) return;
+      setConnectionStatus('reconnecting');
+      setShowRejoin(true);
+      sessionStorage.setItem(LAST_ROOM_KEY, JSON.stringify({ code: roomCode, ts: Date.now() }));
       toast.error(`Disconnected (${reason}). Reconnecting…`);
+      setTimeout(() => setShowRejoin(false), REJOIN_WINDOW_MS);
     };
     socket.on('disconnect', handleDisconnect);
-    socket.on('connect_error', () => toast.error('Signaling unreachable'));
+    socket.on('connect_error', () => {
+      setConnectionStatus('reconnecting');
+      toast.error('Signaling unreachable');
+    });
+    socket.on('reconnect', () => {
+      if (!isLeaving) {
+        setConnectionStatus('connecting');
+        toast('Reconnected', { icon: '🔄' });
+      }
+    });
+
+    const emitJoin = (socketInstance: Socket) => {
+      socketInstance.emit(
+        'join-room',
+        { roomCode, userId: userIdRef.current },
+        (res: JoinResponse) => {
+          if (!res?.ok) {
+            setMediaError(res?.reason || 'Unable to join room');
+            toast.error(res?.reason || 'Unable to join room');
+            return;
+          }
+          joinedRef.current = true;
+          setConnectionStatus(res.participants.length ? 'in-call' : 'waiting');
+          setSelf({ userId: userIdRef.current, name: res.name });
+          peerConnections.current.forEach((_, id) => closePeer(id));
+          setRemoteStreams({});
+          setSpeakingMap({});
+          setParticipants([{ userId: userIdRef.current, name: res.name }, ...res.participants]);
+          sessionStorage.setItem(LAST_ROOM_KEY, JSON.stringify({ code: roomCode, ts: Date.now() }));
+          if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+            Notification.requestPermission().catch(() => undefined);
+          }
+          res.participants.forEach((p) => {
+            createPeerConnection(p.userId, p.name, true);
+          });
+        }
+      );
+    };
 
     const requestMediaAndJoin = async () => {
       try {
@@ -121,33 +203,13 @@ export default function Room() {
           );
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
         if (cancelled) return;
         localStreamRef.current = stream;
         stream.getAudioTracks().forEach((track) => (track.enabled = !muted));
         userIdRef.current = userIdRef.current || uuidv4();
 
-        if (!joinedRef.current) {
-          socket.emit(
-            'join-room',
-            { roomCode, userId: userIdRef.current },
-            (res: JoinResponse) => {
-              if (!res?.ok) {
-                setMediaError(res?.reason || 'Unable to join room');
-                toast.error(res?.reason || 'Unable to join room');
-                return;
-              }
-              joinedRef.current = true;
-              setSelf({ userId: userIdRef.current, name: res.name });
-              setParticipants([{ userId: userIdRef.current, name: res.name }, ...res.participants]);
-
-              // Initiate offers to existing members
-              res.participants.forEach((p) => {
-                createPeerConnection(p.userId, p.name, true);
-              });
-            }
-          );
-        }
+        emitJoin(socket);
       } catch (err) {
         console.error(err);
         const message =
@@ -160,9 +222,17 @@ export default function Room() {
     };
 
     requestMediaAndJoin();
+    socket.on('reconnect', () => emitJoin(socket));
+    socket.on('connect', () => {
+      if (joinedRef.current) {
+        emitJoin(socket);
+      }
+    });
 
     return () => {
       cancelled = true;
+      socket.off('reconnect');
+      socket.off('connect');
       leaveRoom();
       socket.disconnect();
     };
@@ -203,15 +273,35 @@ export default function Room() {
         if (prev.find((p) => p.userId === userId)) return prev;
         return [...prev, { userId, name }];
       });
+      setConnectionStatus('in-call');
+      if (
+        typeof document !== 'undefined' &&
+        document.hidden &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'granted'
+      ) {
+        new Notification('Peer joined', { body: `In room ${roomCode}` });
+      }
     };
 
     const onUserLeft = ({ userId }: { userId: string }) => {
       closePeer(userId);
-      setParticipants((prev) => prev.filter((p) => p.userId !== userId));
+      setParticipants((prev) => {
+        const next = prev.filter((p) => p.userId !== userId);
+        if (next.filter((p) => p.userId !== self?.userId).length === 0) {
+          setConnectionStatus('waiting');
+        }
+        return next;
+      });
       setRemoteStreams((prev) => {
         const next = { ...prev };
         delete next[userId];
         return next;
+      });
+      setSpeakingMap((prev) => {
+        const copy = { ...prev };
+        delete copy[userId];
+        return copy;
       });
     };
 
@@ -231,19 +321,141 @@ export default function Room() {
   }, [roomCode]);
 
   useEffect(() => {
-    // Apply speaker preference when streams mount
-    audioRefs.current.forEach((audio) => applySinkPreference(audio));
-  }, [speakerOn, remoteStreams]);
-
-  useEffect(() => {
     const handleUnload = () => leaveRoom();
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        const socket = socketRef.current;
+        if (socket && !socket.connected) {
+          socket.connect();
+          setConnectionStatus('reconnecting');
+        }
+      }
+    };
     window.addEventListener('beforeunload', handleUnload);
-    return () => window.removeEventListener('beforeunload', handleUnload);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('beforeunload', handleUnload);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const collect = async () => {
+      let totalJitter = 0;
+      let count = 0;
+      let lost = 0;
+      let received = 0;
+      await Promise.all(
+        Array.from(peerConnections.current.values()).map(async (pc) => {
+          const stats = await pc.getStats();
+          stats.forEach((report) => {
+            if (
+              report.type === 'inbound-rtp' &&
+              ((report as any).kind === 'audio' || (report as any).mediaType === 'audio')
+            ) {
+              const inbound = report as any;
+              if (typeof inbound.jitter === 'number') {
+                totalJitter += inbound.jitter * 1000; // s -> ms
+                count += 1;
+              }
+              if (typeof inbound.packetsLost === 'number') lost += inbound.packetsLost;
+              if (typeof inbound.packetsReceived === 'number') received += inbound.packetsReceived;
+            }
+          });
+        })
+      );
+      const jitter = count ? totalJitter / count : 0;
+      const loss = received ? (lost / (lost + received)) * 100 : 0;
+      let level: QualityLevel = 'good';
+      if (loss > 5 || jitter > 60) level = 'bad';
+      else if (loss > 2 || jitter > 30) level = 'warn';
+      setQuality({ level, jitter: Number(jitter.toFixed(1)), loss: Number(loss.toFixed(1)) });
+      if ((level === 'warn' || level === 'bad') && !showQualityTip) {
+        setShowQualityTip(true);
+        if (qualityTipTimeoutRef.current) clearTimeout(qualityTipTimeoutRef.current);
+        qualityTipTimeoutRef.current = window.setTimeout(() => setShowQualityTip(false), 4000);
+      }
+    };
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+    }
+    statsIntervalRef.current = window.setInterval(collect, 3000);
+    return () => {
+      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+    };
+  }, [showQualityTip]);
+
+  useEffect(() => {
+    if (connectionStatus === 'in-call' || connectionStatus === 'waiting') {
+      setShowRejoin(false);
+    }
+  }, [connectionStatus]);
+
   const participantName = (userId: string) =>
     participants.find((p) => p.userId === userId)?.name || 'Guest';
+
+  const ensureAudioContext = () => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext();
+    }
+    return audioCtxRef.current;
+  };
+
+  const attachVAD = (peerId: string, stream: MediaStream) => {
+    const ctx = ensureAudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.65;
+    source.connect(analyser);
+    const data = new Float32Array(analyser.frequencyBinCount);
+    vadNodesRef.current.set(peerId, analyser);
+    vadDataRef.current.set(peerId, data);
+
+    const tick = () => {
+      const node = vadNodesRef.current.get(peerId);
+      const buffer = vadDataRef.current.get(peerId);
+      if (!node || !buffer) return;
+      node.getFloatTimeDomainData(buffer);
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i += 1) {
+        sum += buffer[i] * buffer[i];
+      }
+      const rms = Math.sqrt(sum / buffer.length) || 1e-8;
+      const db = 20 * Math.log10(rms);
+      const now = performance.now();
+      const last = vadActiveRef.current.get(peerId) || 0;
+      if (db > SPEAKING_THRESHOLD_DB) {
+        if (!last) vadActiveRef.current.set(peerId, now);
+        if (now - (vadActiveRef.current.get(peerId) || now) > SPEAKING_DEBOUNCE_MS) {
+          setSpeakingMap((prev) => {
+            if (prev[peerId]) return prev;
+            return { ...prev, [peerId]: true };
+          });
+        }
+      } else {
+        vadActiveRef.current.set(peerId, 0);
+        setSpeakingMap((prev) => {
+          if (!prev[peerId]) return prev;
+          const copy = { ...prev };
+          copy[peerId] = false;
+          return copy;
+        });
+      }
+      vadTimersRef.current.set(peerId, requestAnimationFrame(tick));
+    };
+    vadTimersRef.current.set(peerId, requestAnimationFrame(tick));
+  };
+
+  const clearVAD = (peerId: string) => {
+    const timer = vadTimersRef.current.get(peerId);
+    if (timer) cancelAnimationFrame(timer);
+    vadTimersRef.current.delete(peerId);
+    vadNodesRef.current.delete(peerId);
+    vadDataRef.current.delete(peerId);
+    vadActiveRef.current.delete(peerId);
+  };
 
   const createPeerConnection = (peerId: string, peerName: string, initiator: boolean) => {
     if (peerConnections.current.has(peerId)) {
@@ -270,15 +482,42 @@ export default function Room() {
     pc.ontrack = (event) => {
       const [stream] = event.streams.length ? event.streams : [new MediaStream([event.track])];
       setRemoteStreams((prev) => ({ ...prev, [peerId]: stream }));
+      attachVAD(peerId, stream);
+      setConnectionStatus('in-call');
     };
 
     pc.onconnectionstatechange = () => {
-      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        setConnectionStatus('reconnecting');
+        restartIce(peerId, pc);
+      }
+      if (pc.connectionState === 'closed') {
         closePeer(peerId);
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        setConnectionStatus('reconnecting');
+        restartIce(peerId, pc);
+      }
+      if (pc.iceConnectionState === 'connected') {
+        setConnectionStatus('in-call');
+      }
+    };
+
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    // Enable opus DTX to reduce background noise without extra latency
+    pc.getSenders()
+      .filter((s) => s.track?.kind === 'audio')
+      .forEach((sender) => {
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].dtx = 'enabled';
+        sender.setParameters(params).catch(() => undefined);
+      });
     peerConnections.current.set(peerId, pc);
 
     if (initiator) {
@@ -297,12 +536,27 @@ export default function Room() {
     return pc;
   };
 
+  const restartIce = (peerId: string, pc: RTCPeerConnection) => {
+    if (!pc) return;
+    pc.createOffer({ iceRestart: true })
+      .then((offer) => pc.setLocalDescription(offer))
+      .then(() => {
+        socketRef.current?.emit('offer', {
+          roomCode,
+          to: peerId,
+          description: pc.localDescription
+        });
+      })
+      .catch((err) => console.error('ICE restart failed', err));
+  };
+
   const closePeer = (peerId: string) => {
     const pc = peerConnections.current.get(peerId);
     if (pc) {
       pc.close();
       peerConnections.current.delete(peerId);
     }
+    clearVAD(peerId);
     const audio = audioRefs.current.get(peerId);
     if (audio) {
       audio.srcObject = null;
@@ -313,10 +567,16 @@ export default function Room() {
   const leaveRoom = () => {
     if (isLeaving) return;
     setIsLeaving(true);
+    sessionStorage.setItem(LAST_ROOM_KEY, JSON.stringify({ code: roomCode, ts: Date.now() }));
     socketRef.current?.emit('leave-room', { roomCode, userId: userIdRef.current });
     peerConnections.current.forEach((_, id) => closePeer(id));
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     socketRef.current?.disconnect();
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => undefined);
+      audioCtxRef.current = null;
+    }
+    if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
   };
 
   const toggleMute = () => {
@@ -326,31 +586,31 @@ export default function Room() {
     localStreamRef.current?.getAudioTracks().forEach((track) => {
       track.enabled = !next;
     });
+    buzz();
   };
 
-  const applySinkPreference = (audio: HTMLAudioElement) => {
-    if (!audio || typeof (audio as any).setSinkId !== 'function') {
-      if (!sinkWarningShown.current) {
-        sinkWarningShown.current = true;
-        toast.error('Speaker switch not supported on this device');
-      }
-      return;
-    }
-    const target = speakerOn ? 'communications' : 'default';
-    (audio as any)
-      .setSinkId(target)
-      .catch(() => {
-        if (!sinkWarningShown.current) {
-          sinkWarningShown.current = true;
-          toast.error('Speaker switch not supported on this device');
-        }
-      });
-  };
-
-  const toggleSpeaker = () => {
-    const next = !speakerOn;
-    setSpeakerOn(next);
-    setBooleanPref('vibeme-speaker', next);
+  const toggleNoiseCancel = async () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const next = !noiseCancelOn;
+    setNoiseCancelOn(next);
+    buzz();
+    const tasks = stream.getAudioTracks().map((t) =>
+      t
+        .applyConstraints({
+          echoCancellation: next,
+          noiseSuppression: next,
+          autoGainControl: next,
+          googEchoCancellation: next,
+          googAutoGainControl: next,
+          googNoiseSuppression: next,
+          googNoiseSuppression2: next
+        })
+        .catch(() => {
+          toast.error('Noise cancel not supported');
+        })
+    );
+    await Promise.all(tasks);
   };
 
   const handleLeave = () => {
@@ -363,6 +623,35 @@ export default function Room() {
 
   return (
     <div className="min-h-screen flex flex-col bg-background text-white">
+      {connectionStatus !== 'in-call' && (
+        <div className="status-overlay">
+          {connectionStatus === 'connecting' || connectionStatus === 'waiting' ? (
+            <span className="spinner" />
+          ) : (
+            <span className="pulse" />
+          )}
+          <span>
+            {connectionStatus === 'connecting' && 'Подключаемся...'}
+            {connectionStatus === 'waiting' && 'Ждем собеседника...'}
+            {connectionStatus === 'reconnecting' && 'Переподключаемся...'}
+          </span>
+        </div>
+      )}
+      {showRejoin && (
+        <div className="fixed top-4 right-4 z-50">
+          <button
+            className="button-primary"
+            onClick={() => {
+              buzz();
+              socketRef.current?.connect();
+              setShowRejoin(false);
+              setConnectionStatus('reconnecting');
+            }}
+          >
+            Rejoin last room
+          </button>
+        </div>
+      )}
       {mediaError && (
         <div className="p-4 bg-danger/20 text-white border-b border-danger/40 flex flex-col gap-2">
           <p className="font-semibold">Нужен доступ к микрофону</p>
@@ -374,7 +663,7 @@ export default function Room() {
                 try {
                   setMediaError(null);
                   setRequestingMedia(true);
-                  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                  const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
                   localStreamRef.current = stream;
                   stream.getAudioTracks().forEach((t) => (t.enabled = !muted));
                   if (!joinedRef.current && socketRef.current) {
@@ -389,7 +678,11 @@ export default function Room() {
                           return;
                         }
                         joinedRef.current = true;
+                        setConnectionStatus(res.participants.length ? 'in-call' : 'waiting');
                         setSelf({ userId: userIdRef.current, name: res.name });
+                        peerConnections.current.forEach((_, id) => closePeer(id));
+                        setRemoteStreams({});
+                        setSpeakingMap({});
                         setParticipants([
                           { userId: userIdRef.current, name: res.name },
                           ...res.participants
@@ -450,7 +743,9 @@ export default function Room() {
             .map((p) => (
               <div
                 key={p.userId}
-                className="relative rounded-2xl glass p-4 flex flex-col justify-end overflow-hidden min-h-[200px]"
+                className={`relative rounded-2xl glass p-4 flex flex-col justify-end overflow-hidden min-h-[200px] ${
+                  speakingMap[p.userId] ? 'speaking' : ''
+                }`}
               >
                 <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent" />
                 <div className="relative z-10">
@@ -465,7 +760,6 @@ export default function Room() {
                       node.playsInline = true;
                       node.muted = false;
                       audioRefs.current.set(p.userId, node);
-                      applySinkPreference(node);
                     }
                   }}
                 />
@@ -489,13 +783,9 @@ export default function Room() {
             <Icon name={muted ? 'mic-off' : 'mic'} />
             <span>{muted ? 'Unmute' : 'Mute'}</span>
           </button>
-          <button
-            className="button-ghost flex items-center gap-2"
-            onClick={toggleSpeaker}
-            title="Toggle speaker mode"
-          >
-            <Icon name={speakerOn ? 'volume-off' : 'volume'} />
-            <span>Speaker {speakerOn ? 'Off' : 'On'}</span>
+          <button className="button-ghost flex items-center gap-2" onClick={toggleNoiseCancel}>
+            <Icon name="mic" />
+            <span>Noise Cancel: {noiseCancelOn ? 'On' : 'Off'}</span>
           </button>
           <button
             className="button-primary bg-danger hover:bg-danger/90 flex items-center gap-2"
@@ -506,6 +796,24 @@ export default function Room() {
           </button>
         </div>
       </footer>
+
+      <div className="quality-badge">
+        <span
+          className="quality-dot"
+          style={{
+            background:
+              quality.level === 'good' ? '#10b981' : quality.level === 'warn' ? '#f59e0b' : '#ef4444'
+          }}
+        />
+        <span>
+          Quality: {quality.level.toUpperCase()} · jitter {quality.jitter} ms · loss {quality.loss}%
+        </span>
+        {showQualityTip && (
+          <div className="tooltip">
+            Проверьте интернет, вас может не слышно. Перейдите ближе к роутеру или включите relay/TURN.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

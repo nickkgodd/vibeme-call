@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import Modal from '../components/Modal';
@@ -16,6 +16,14 @@ const computeApiBase = () => {
 };
 
 const API_BASE = computeApiBase();
+const LAST_ROOM_KEY = 'vibeme-last-room';
+const REJOIN_WINDOW_MS = 10_000;
+
+const buzz = (duration = 50) => {
+  if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    navigator.vibrate(duration);
+  }
+};
 
 export default function Home() {
   const navigate = useNavigate();
@@ -24,6 +32,7 @@ export default function Home() {
   const [creating, setCreating] = useState(false);
   const [createdCode, setCreatedCode] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [rejoinCode, setRejoinCode] = useState<string | null>(null);
 
   const accentShadow = useMemo(
     () => ({
@@ -32,9 +41,45 @@ export default function Home() {
     []
   );
 
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(LAST_ROOM_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw) as { code?: string; ts?: number };
+      if (data.code && data.ts && Date.now() - data.ts < REJOIN_WINDOW_MS) {
+        setRejoinCode(data.code);
+        const timer = setTimeout(() => setRejoinCode(null), REJOIN_WINDOW_MS - (Date.now() - data.ts));
+        return () => clearTimeout(timer);
+      }
+    } catch {
+      // ignore parsing issues
+    }
+    return undefined;
+  }, []);
+
+const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: true },
+    autoGainControl: { ideal: true },
+    googEchoCancellation: true,
+    googAutoGainControl: true,
+    googNoiseSuppression: true,
+    googNoiseSuppression2: true,
+    sampleRate: 48000,
+    channelCount: 1
+  }
+};
+
+const warmMicPermission = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+  stream.getTracks().forEach((t) => t.stop());
+};
+
   const handleCreate = async () => {
     setCreating(true);
     try {
+      await warmMicPermission();
       const res = await fetch(`${API_BASE}/api/room`, { method: 'POST' });
       if (!res.ok) throw new Error('Unable to create room');
       const data = (await res.json()) as { code: string };
@@ -58,6 +103,7 @@ export default function Home() {
     }
     setChecking(true);
     try {
+      await warmMicPermission();
       const res = await fetch(`${API_BASE}/api/room/${code}/exists`);
       if (!res.ok) throw new Error('Room check failed');
       const data = (await res.json()) as { exists: boolean; full?: boolean };
@@ -83,6 +129,16 @@ export default function Home() {
     if (!createdCode) return;
     navigator.clipboard.writeText(createdCode).then(
       () => toast.success('Copied'),
+      () => toast.error('Copy failed')
+    );
+  };
+
+  const copyJoinLink = () => {
+    if (!createdCode) return;
+    const base = typeof window !== 'undefined' ? window.location.origin : 'https://yourapp.pages.dev';
+    const link = `${base.replace(/\/$/, '')}/room/${createdCode}`;
+    navigator.clipboard.writeText(link).then(
+      () => toast.success('Copied link!'),
       () => toast.error('Copy failed')
     );
   };
@@ -117,6 +173,17 @@ export default function Home() {
           >
             Join Room
           </button>
+          {rejoinCode && (
+            <button
+              className="button-primary w-full sm:w-auto"
+              onClick={() => {
+                buzz();
+                navigate(`/room/${rejoinCode}`);
+              }}
+            >
+              Rejoin last room
+            </button>
+          )}
         </div>
 
         <div className="grid sm:grid-cols-3 gap-4 text-left text-white/80">
@@ -168,6 +235,9 @@ export default function Home() {
               </div>
             </button>
           </div>
+          <button className="button-secondary w-full" onClick={copyJoinLink}>
+            Copy join link
+          </button>
           <p className="text-sm text-white/50">
             You&apos;ll auto-join as the creator. Keep this tab open to accept peers.
           </p>
